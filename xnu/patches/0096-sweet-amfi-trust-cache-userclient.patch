@@ -1,0 +1,265 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetMobileFileIntegrity.cpp                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = AppleMobileFileIntegrity;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMobileFileIntegrity.cpp
+@@ -0,0 +1,238 @@
++/*
++ * Built-in AppleMobileFileIntegrity trust-cache service for SWEET.
++ *
++ * On Apple hardware iBoot loads Apple's trust caches (lists of the code
++ * directory hashes of every binary Apple ships on the system volume) and the
++ * AMFI kext answers "is this cdhash Apple's?" for user space through its user
++ * client. SWEET has no iBoot, Image4 or AMFI kext, so that question failed and
++ * every check was treated as "not Apple's". ExtensionFoundation
++ * (+[NSDictionary _EX_dictionaryWithSignedURL:error:]) and libmis
++ * (MobileInstallation's signature validation) both ask it; on iOS 16 that left
++ * no app extension registered with LaunchServices, so PosterBoard found no
++ * wallpaper providers and the lock screen stayed black.
++ *
++ * tools/trustcache.py takes Apple's own trust caches from the IPSW
++ * (StaticTrustCache and the Cryptex1 system/app trust caches, unchanged) and
++ * tools/mkadt.py publishes them as /chosen/sweet-trust-caches:
++ *
++ *   "STC1" | u32 module count | { u32 length | module bytes | pad to 4 }...
++ *
++ * Each module is a standard trust cache (version 0/1/2: u32 version, uuid[16],
++ * u32 count, then entries sorted by their leading 20-byte cdhash).
++ *
++ * Both callers use: IOServiceOpen(type 0), IOConnectCallMethod selector 6,
++ * one scalar input (1) and the 20-byte cdhash as structure input. The reply is
++ * kIOReturnSuccess when the cdhash is in a trust cache and kIOReturnNotFound
++ * when it is not (libmis maps that to its "not in the trust cache" error).
++ * Nothing is added to Apple's lists; other selectors are unsupported.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSData.h>
++#include <sys/proc.h>
++#include <string.h>
++
++#define SWEET_TC_CDHASH_LEN     20
++#define SWEET_TC_MAX_MODULES    8
++#define SWEET_TC_SELECTOR_QUERY 6
++
++struct sweet_trust_cache {
++	const uint8_t *entries;
++	uint32_t       count;
++	uint32_t       entry_size;
++};
++
++static struct sweet_trust_cache sweet_tc[SWEET_TC_MAX_MODULES];
++static uint32_t sweet_tc_modules;
++static OSData *sweet_tc_data;           /* retained; backs sweet_tc[] */
++
++static uint32_t
++sweet_tc_entry_size(uint32_t version)
++{
++	switch (version) {
++	case 0: return 20;      /* cdhash */
++	case 1: return 22;      /* cdhash, hash type, flags */
++	case 2: return 24;      /* cdhash, hash type, flags, constraint category, reserved */
++	default: return 0;
++	}
++}
++
++static uint32_t
++sweet_tc_read32(const uint8_t *p)
++{
++	uint32_t v;
++	memcpy(&v, p, sizeof(v));
++	return v;               /* little endian, like the trust cache format */
++}
++
++/* Validate the whole bundle before using any of it. */
++static bool
++sweet_tc_load(OSData *data, uint32_t *total)
++{
++	const uint8_t *base = (const uint8_t *)data->getBytesNoCopy();
++	size_t len = data->getLength();
++	if (base == NULL || len < 8 || memcmp(base, "STC1", 4) != 0) {
++		return false;
++	}
++	uint32_t modules = sweet_tc_read32(base + 4);
++	if (modules == 0 || modules > SWEET_TC_MAX_MODULES) {
++		return false;
++	}
++	size_t off = 8;
++	*total = 0;
++	for (uint32_t i = 0; i < modules; i++) {
++		if (len - off < 4) {
++			return false;
++		}
++		uint32_t mlen = sweet_tc_read32(base + off);
++		off += 4;
++		if (mlen < 24 || mlen > len - off) {
++			return false;
++		}
++		const uint8_t *m = base + off;
++		uint32_t size = sweet_tc_entry_size(sweet_tc_read32(m));
++		uint32_t count = sweet_tc_read32(m + 20);
++		if (size == 0 || (uint64_t)count * size != (uint64_t)mlen - 24) {
++			return false;
++		}
++		const uint8_t *entries = m + 24;
++		for (uint32_t e = 1; e < count; e++) {
++			if (memcmp(entries + (e - 1) * size, entries + e * size, SWEET_TC_CDHASH_LEN) > 0) {
++				return false;   /* binary search needs sorted entries */
++			}
++		}
++		sweet_tc[i].entries = entries;
++		sweet_tc[i].count = count;
++		sweet_tc[i].entry_size = size;
++		*total += count;
++		off += mlen;
++		off += (4 - (off & 3)) & 3;
++		if (off > len) {
++			return false;
++		}
++	}
++	sweet_tc_modules = modules;
++	return true;
++}
++
++static bool
++sweet_tc_contains(const uint8_t cdhash[SWEET_TC_CDHASH_LEN])
++{
++	for (uint32_t i = 0; i < sweet_tc_modules; i++) {
++		uint32_t lo = 0, hi = sweet_tc[i].count;
++		while (lo < hi) {
++			uint32_t mid = lo + (hi - lo) / 2;
++			int c = memcmp(sweet_tc[i].entries + (size_t)mid * sweet_tc[i].entry_size,
++			    cdhash, SWEET_TC_CDHASH_LEN);
++			if (c == 0) {
++				return true;
++			}
++			if (c < 0) {
++				lo = mid + 1;
++			} else {
++				hi = mid;
++			}
++		}
++	}
++	return false;
++}
++
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++	OSData *data = chosen ? OSDynamicCast(OSData, chosen->getProperty("sweet-trust-caches")) : NULL;
++	uint32_t total = 0;
++	if (data != NULL && sweet_tc_load(data, &total)) {
++		data->retain();
++		sweet_tc_data = data;
++		IOLog("SWEET AMFI: %u trust caches, %u cdhashes\n", sweet_tc_modules, total);
++	} else {
++		/* Answer honestly with no lists rather than failing to match. */
++		sweet_tc_modules = 0;
++		IOLog("SWEET AMFI: no valid /chosen/sweet-trust-caches; every cdhash is untrusted\n");
++	}
++	OSSafeReleaseNULL(chosen);
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static uint64_t sweet_amfi_logged;      /* selectors already logged (< 64) */
++static uint32_t sweet_amfi_queries, sweet_amfi_trusted;
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++
++	if (selector != SWEET_TC_SELECTOR_QUERY) {
++		if (selector >= 64 || !(sweet_amfi_logged & (1ULL << selector))) {
++			if (selector < 64) {
++				sweet_amfi_logged |= 1ULL << selector;
++			}
++			IOLog("SWEET AMFI: %s sel %u unsupported\n", name, selector);
++		}
++		return kIOReturnUnsupported;
++	}
++	if (args->scalarInputCount != 1 || args->scalarInput[0] != 1 ||
++	    args->structureInput == NULL || args->structureInputSize != SWEET_TC_CDHASH_LEN) {
++		IOLog("SWEET AMFI: %s trust query with unexpected arguments (%u scalars, %u bytes)\n",
++		    name, args->scalarInputCount, args->structureInputSize);
++		return kIOReturnBadArgument;
++	}
++	bool trusted = sweet_tc_contains((const uint8_t *)args->structureInput);
++	uint32_t n = OSIncrementAtomic((volatile SInt32 *)&sweet_amfi_queries) + 1;
++	if (trusted) {
++		OSIncrementAtomic((volatile SInt32 *)&sweet_amfi_trusted);
++	}
++	/* First queries and every 256th: enough to see who asks without flooding. */
++	if (n <= 16 || (n & 255) == 0) {
++		const uint8_t *h = (const uint8_t *)args->structureInput;
++		IOLog("SWEET AMFI: %s trust query %u cdhash %02x%02x%02x%02x... -> %s (%u/%u trusted)\n",
++		    name, n, h[0], h[1], h[2], h[3], trusted ? "trusted" : "not found",
++		    sweet_amfi_trusted, n);
++	}
++	return trusted ? kIOReturnSuccess : kIOReturnNotFound;
++}
++#endif /* SWEET */
